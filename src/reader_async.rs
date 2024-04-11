@@ -2,7 +2,7 @@
 //! downloading them in entirety.
 
 use futures::channel::oneshot;
-use futures::future::BoxFuture;
+use futures::future::{join_all, BoxFuture};
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 use std::ops::Range;
@@ -192,28 +192,20 @@ impl HTTPFileReader {
             coalesce_byte_size,
         }
     }
+    pub async fn make_range_request(&self, range: &Range<usize>) -> Bytes {
+        let range_str =
+            range_from_start_and_length(range.start as u64, (range.end - range.start) as u64);
+        // Map reqwest error to parquet error
+        // let map_err = |err| parquet::errors::ParquetError::External(Box::new(err));
+        make_range_request_with_client(self.url.to_string(), self.client.clone(), range_str)
+            .await
+            .unwrap()
+    }
 }
 
 impl AsyncFileReader for HTTPFileReader {
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        async move {
-            let range_str =
-                range_from_start_and_length(range.start as u64, (range.end - range.start) as u64);
-
-            // Map reqwest error to parquet error
-            // let map_err = |err| parquet::errors::ParquetError::External(Box::new(err));
-
-            let bytes = make_range_request_with_client(
-                self.url.to_string(),
-                self.client.clone(),
-                range_str,
-            )
-            .await
-            .unwrap();
-
-            Ok(bytes)
-        }
-        .boxed()
+        async move { Ok(self.make_range_request(&range).await) }.boxed()
     }
 
     fn get_byte_ranges(
@@ -221,16 +213,17 @@ impl AsyncFileReader for HTTPFileReader {
         ranges: Vec<Range<usize>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let fetch_ranges = merge_ranges(&ranges, self.coalesce_byte_size);
-
-        // NOTE: This still does _sequential_ requests, but it should be _fewer_ requests if they
-        // can be merged.
         async move {
             let mut fetched = Vec::with_capacity(ranges.len());
+            let lazy_range_bytes = fetch_ranges
+                .iter()
+                .map(|range| self.make_range_request(range));
 
-            for range in fetch_ranges.iter() {
-                let data = self.get_bytes(range.clone()).await?;
-                fetched.push(data);
+
+            for bytes in join_all(lazy_range_bytes).await {
+                fetched.push(bytes);
             }
+
 
             Ok(ranges
                 .iter()
